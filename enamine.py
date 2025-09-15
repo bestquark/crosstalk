@@ -24,6 +24,8 @@ import scipy
 import itertools
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
+from scipy.sparse import csr_matrix, save_npz
+
 
 import pyarrow as pa
 from pyarrow.parquet import ParquetFile
@@ -66,7 +68,8 @@ train_sel = train_IDs['ID'].to_list()
 def _process_batch_smiles(batch_smiles, start_idx):
     outs = Parallel(
         n_jobs=-1, backend="loky", prefer="processes",
-        batch_size=256, pre_dispatch="3*n_jobs", max_nbytes=None
+        batch_size=256, pre_dispatch="3*n_jobs", max_nbytes=None,
+        max_nbytes="1M" 
     )(delayed(props_and_fps_from_smiles)(smi, start_idx+i)
     for i, smi in enumerate(batch_smiles))
     return outs
@@ -199,11 +202,34 @@ class MemoryOptimizedSDFAnalyzer:
         return props, fps_dict
 
 
+    # def process_molecules_in_batches(self, max_molecules=None, batch_size=5000):
+    #     supplier = Chem.SDMolSupplier(str(self.sdf_file_path))
+    #     processed = 0
+    #     self.fingerprints = {"ECFP4": [], "AVALON": []}
+    #     self.properties = []
+
+    #     while True:
+    #         batch = [m for _, m in zip(range(batch_size), supplier) if m is not None]
+    #         if not batch: break
+    #         if max_molecules and processed >= max_molecules: break
+    #         if max_molecules:
+    #             over = processed + len(batch) - max_molecules
+    #             if over > 0: batch = batch[:-over]
+    #         batch_smiles = [Chem.MolToSmiles(m) for m in batch]
+
+    #         for props, fps in _process_batch_smiles(batch_smiles, processed):
+    #             self.properties.append(props)
+    #             for k, v in fps.items():
+    #                 if v is not None:
+    #                     self.fingerprints[k].append(v)
+    #         processed += len(batch)
     def process_molecules_in_batches(self, max_molecules=None, batch_size=5000):
         supplier = Chem.SDMolSupplier(str(self.sdf_file_path))
         processed = 0
         self.fingerprints = {"ECFP4": [], "AVALON": []}
         self.properties = []
+        batch_idx = 0
+        FLUSH_EVERY = 10  # save & clear every 10 batches
 
         while True:
             batch = [m for _, m in zip(range(batch_size), supplier) if m is not None]
@@ -212,14 +238,30 @@ class MemoryOptimizedSDFAnalyzer:
             if max_molecules:
                 over = processed + len(batch) - max_molecules
                 if over > 0: batch = batch[:-over]
-            batch_smiles = [Chem.MolToSmiles(m) for m in batch]
 
-            for props, fps in _process_batch_smiles(batch_smiles, processed):
+            batch_idx += 1
+            batch_smiles = [Chem.MolToSmiles(m) for m in batch]
+            outs = _process_batch_smiles(batch_smiles, processed)
+
+            for props, fps in outs:
                 self.properties.append(props)
                 for k, v in fps.items():
                     if v is not None:
                         self.fingerprints[k].append(v)
+
             processed += len(batch)
+            del batch, batch_smiles, outs
+
+            if batch_idx % FLUSH_EVERY == 0:
+                self._save_intermediate_results(batch_idx)
+                # free RAM: convert lists -> arrays for save, then clear
+                self.properties.clear()
+                for k in list(self.fingerprints.keys()):
+                    self.fingerprints[k].clear()
+                gc.collect()
+
+        # final flush
+        self._save_intermediate_results(batch_idx)
 
     def _process_batch(self, supplier, batch_size, start_idx, max_molecules):
         """Process a single batch of molecules."""
@@ -328,29 +370,17 @@ class MemoryOptimizedSDFAnalyzer:
             }
 
     def _save_intermediate_results(self, batch_count):
-        """Save intermediate results to avoid data loss using sparse storage."""
-        print(f"Saving intermediate results after batch {batch_count}...")
-
-        # Save properties
         if self.properties:
-            props_df = pd.DataFrame(self.properties)
-            props_file = self.output_dir / f"molecular_properties_batch_{batch_count}.csv"
-            props_df.to_csv(props_file, index=False)
+            pd.DataFrame(self.properties).to_csv(
+                self.output_dir / f"molecular_properties_batch_{batch_count}.csv",
+                index=False
+            )
 
-        # Save fingerprints as sparse matrices to save disk space
         for fp_name, fps in self.fingerprints.items():
             if fps:
-                try:
-                    from scipy.sparse import csr_matrix, save_npz
-                    sparse_fps = csr_matrix(fps)
-                    fp_file = self.output_dir / f"{fp_name}_sparse_batch_{batch_count}.npz"
-                    save_npz(fp_file, sparse_fps)
-                    print(f"Saved {fp_name} as sparse matrix (saves ~80% disk space)")
-                except ImportError:
-                    # Fallback to regular numpy save if scipy not available
-                    fp_file = self.output_dir / f"{fp_name}_fingerprints_batch_{batch_count}.npy"
-                    np.save(fp_file, np.array(fps))
-                    print(f"Saved {fp_name} as regular numpy array")
+                arr = np.asarray(fps, dtype=np.int8)   # (n, 2048)
+                save_npz(self.output_dir / f"{fp_name}_sparse_batch_{batch_count}.npz",
+                        csr_matrix(arr))
 
     def finalize_results(self):
         """Finalize and save all results."""
@@ -441,8 +471,8 @@ class MemoryOptimizedSDFAnalyzer:
         plot_file = self.output_dir / "molecular_properties_distribution.png"
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
         print(f"Visualization saved to {plot_file}")
-        plt.show()
-
+        plt.close()
+        
     def export_for_ml_workflow(self):
         """Export data in format compatible with existing ML workflow."""
         print("Exporting data for ML workflow integration...")
@@ -600,16 +630,18 @@ def basic_dataloader(
             # exploded = batch_df[x_col].str.split(',', expand=True).astype(float, copy=False)
             # filtered_data.append(scipy.sparse.csr_matrix(exploded))
             vals = batch_df[x_col].values
-            mat = scipy.sparse.csr_matrix(
-                np.fromstring(",".join(vals), sep=",", dtype=float).reshape(len(vals), -1)
-            )
+            # mat = scipy.sparse.csr_matrix(
+            #     np.fromstring(",".join(vals), sep=",", dtype=float).reshape(len(vals), -1)
+            # )
+            rows = [np.fromstring(s, sep=",", dtype=float) for s in vals]
+            mat = scipy.sparse.csr_matrix(np.vstack(rows))
             filtered_data.append(mat)
 
             if y_col is not None:
                 y_list.append(batch_df[y_col].values)
             loaded += len(batch_df)
-        del batch_df, exploded
-
+        del batch_df, vals, rows
+        gc.collect()
     # Combine filtered data
     if filtered_data:
         X = scipy.sparse.vstack(filtered_data)
@@ -638,7 +670,8 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.ensemble import BaggingClassifier
 from sklearn.model_selection import cross_val_predict
 import numpy as np
-from eval import BinaryEvaluator
+# from eval import BinaryEvaluator
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, precision_score, recall_score
 
 def train_ensemble_model(X_tr,Y_tr, model_type):
   # Create an ensemble of XGBoost models
@@ -687,14 +720,41 @@ def get_predictions(ensemble_model, X):
     Y_prob = np.column_stack([1-probs.mean(axis=0), probs.mean(axis=0)])
     return Y_pred, Y_prob, mean_prediction, ci_low, ci_high
 
-def evaluate(X, Y, Y_prob):
-  eval = BinaryEvaluator(X.toarray(), Y)
-  metric_dict = eval.compute_metrics(yt=Y, yp=Y_prob[:,1]) # or validation
+# def evaluate(X, Y, Y_prob):
+#   eval = BinaryEvaluator(X.toarray(), Y)
+#   metric_dict = eval.compute_metrics(yt=Y, yp=Y_prob[:,1]) # or validation
 
-  for metric_name, metric_val in metric_dict.items():
-      print(f'{metric_name:20s}: {metric_val:.2f}')
+#   for metric_name, metric_val in metric_dict.items():
+#       print(f'{metric_name:20s}: {metric_val:.2f}')
 
-  return metric_dict
+#   return metric_dict
+
+def evaluate(Y, Y_prob, thr=0.5, klist=(5,10,30)):
+    yp = Y_prob[:,1]
+    pred = (yp >= thr).astype(int)
+    m = {
+        "accuracy": accuracy_score(Y, pred),
+        "balanced_accuracy": balanced_accuracy_score(Y, pred),
+        "roc_auc": roc_auc_score(Y, yp),
+        "precision": precision_score(Y, pred, zero_division=0),
+        "recall": recall_score(Y, pred),
+    }
+    # hits@k / precision@k if you still want them:
+    order = np.argsort(yp)
+    for k in list(klist) + [int((Y == 1).sum())]:
+        topk = order[-k:]
+        m[f"precision_at_{k}"] = (Y[topk] == 1).sum() / max(k,1)
+        # hits@k relative to positives:
+        pos_idx = np.where(Y == 1)[0]
+        if len(pos_idx):
+            ranks = np.searchsorted(yp[order], yp[pos_idx], side="right")
+            hits = (ranks >= len(Y) - k).sum()
+            m[f"hits_at_{k}"] = hits / len(pos_idx)
+        else:
+            m[f"hits_at_{k}"] = 0.0
+    for name, val in m.items():
+        print(f'{name:20s}: {val:.4f}')
+    return m
 
 def train_ensemble_model_for_feature(feature, model):
 
